@@ -161,6 +161,10 @@ This tool uses robust 2D CAD operations (Paper.js) and deterministic 3D extrusio
 
 MIT
 
+## Deployed App
+
+Live demo: https://svg2print.vercel.app
+
 ## Contributing
 
-Issues and PRs welcome at https://github.com/YOUR_USERNAME/svg2print
+Issues and PRs welcome at https://github.com/winemarshal68/svg2print

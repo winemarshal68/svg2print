@@ -1,5 +1,14 @@
 import paper from 'paper';
 import type { PreflightResult, PreflightIssue, ProfileSettings } from '../types';
+import {
+  isValidPath,
+  safeGetIntersections,
+  safeSimplify,
+  safeOffset,
+  safeClosePath,
+  safeCreateAndUniteCompound,
+  collectValidPaths,
+} from './paperSafety';
 
 // Initialize Paper.js in memory-only mode
 paper.setup(new paper.Size(1000, 1000));
@@ -8,96 +17,6 @@ export interface ParsedSVG {
   paths: paper.Path[];
   bounds: paper.Rectangle;
   compoundPath: paper.CompoundPath | null;
-}
-
-/**
- * Validate that a Paper.js path is safe to use in geometry operations
- */
-function isValidPath(path: paper.Path): boolean {
-  if (!path || !path.segments) return false;
-  if (path.segments.length < 2) return false;
-
-  // Check for null segments (this is what causes the getDirectedAngle crash)
-  for (const segment of path.segments) {
-    if (!segment || !segment.point) return false;
-    if (isNaN(segment.point.x) || isNaN(segment.point.y)) return false;
-  }
-
-  // Check for valid bounds
-  const bounds = path.bounds;
-  if (!bounds || isNaN(bounds.width) || isNaN(bounds.height)) return false;
-  if (bounds.width === 0 && bounds.height === 0) return false;
-
-  // Check for zero-length paths
-  if (path.length === 0 || isNaN(path.length)) return false;
-
-  return true;
-}
-
-/**
- * Safely get intersections without crashing on degenerate paths
- */
-function safeGetIntersections(path: paper.Path): boolean {
-  if (!isValidPath(path)) return false;
-
-  try {
-    const intersections = path.getIntersections(path);
-    return intersections && intersections.length > 0;
-  } catch (error) {
-    // Paper.js can throw on degenerate geometries
-    console.warn('Failed to check intersections:', error);
-    return false;
-  }
-}
-
-/**
- * Safely simplify a path
- */
-function safeSimplify(path: paper.Path, tolerance: number): paper.Path {
-  if (!isValidPath(path) || tolerance <= 0) return path;
-
-  try {
-    path.simplify(tolerance);
-    return path;
-  } catch (error) {
-    console.warn('Failed to simplify path:', error);
-    return path;
-  }
-}
-
-/**
- * Safely apply offset to a path
- */
-function safeOffset(path: paper.Path, offset: number): paper.Path | null {
-  if (!isValidPath(path) || Math.abs(offset) < 0.001) return path;
-
-  try {
-    const offsetPath = (path as any).offsetPath(offset);
-    if (offsetPath && isValidPath(offsetPath as paper.Path)) {
-      return offsetPath as paper.Path;
-    }
-    return path; // fallback to original if offset fails
-  } catch (error) {
-    console.warn('Failed to offset path:', error);
-    return path; // fallback to original
-  }
-}
-
-/**
- * Safely unite compound paths
- */
-function safeUnite(compound: paper.CompoundPath): paper.CompoundPath | null {
-  if (!compound || !compound.children || compound.children.length === 0) {
-    return null;
-  }
-
-  try {
-    const united = compound.unite(compound);
-    return united as paper.CompoundPath;
-  } catch (error) {
-    console.warn('Failed to unite paths:', error);
-    return compound; // fallback to non-united compound
-  }
 }
 
 export function parseSVG(svgString: string): ParsedSVG {
@@ -112,46 +31,26 @@ export function parseSVG(svgString: string): ParsedSVG {
       throw new Error('Failed to parse SVG - invalid SVG format');
     }
 
-    // Collect all path items
-    const allPaths: paper.Path[] = [];
-
-    function collectPaths(item: paper.Item) {
-      if (item instanceof paper.Path) {
-        const path = item as paper.Path;
-        allPaths.push(path.clone() as paper.Path);
-      } else if (item instanceof paper.CompoundPath) {
-        // Flatten compound paths into individual paths
-        item.children.forEach((child) => {
-          if (child instanceof paper.Path) {
-            allPaths.push(child.clone() as paper.Path);
-          }
-        });
-      } else if (item instanceof paper.Group || item instanceof paper.Layer) {
-        item.children.forEach(collectPaths);
-      }
-    }
-
-    collectPaths(imported);
-
-    // Filter to only valid paths
-    const validPaths = allPaths.filter(isValidPath);
+    // Collect all valid paths using safety helper
+    const validPaths = collectValidPaths(imported);
 
     if (validPaths.length === 0) {
       throw new Error(
-        'SVG contains no valid closed shapes. ' +
-        'Please convert text to paths, expand strokes, and remove invisible objects.'
+        'SVG contains no valid shapes. ' +
+        'Please convert text to paths, expand strokes to fills, and remove invisible objects.'
       );
     }
 
-    // Calculate bounds
-    const bounds = validPaths.reduce((acc, path) => {
-      return acc ? acc.unite(path.bounds) : path.bounds;
-    }, null as paper.Rectangle | null);
+    // Calculate bounds safely
+    let bounds: paper.Rectangle | null = null;
+    for (const path of validPaths) {
+      if (isValidPath(path) && path.bounds) {
+        bounds = bounds ? bounds.unite(path.bounds) : path.bounds;
+      }
+    }
 
     // Create a compound path from all valid paths
-    const compoundPath = new paper.CompoundPath({
-      children: validPaths.map(p => p.clone())
-    });
+    const compoundPath = safeCreateAndUniteCompound(validPaths);
 
     return {
       paths: validPaths,
@@ -222,7 +121,7 @@ export function preflightCheck(
       severity: 'error',
       message: `Found ${invalidPathCount} invalid or degenerate path${invalidPathCount > 1 ? 's' : ''}`,
       detail: 'Paths with zero length, NaN coordinates, or null segments cannot be processed',
-      suggestedFix: 'Clean up your SVG in an editor: remove invisible objects, fix broken paths, simplify geometry',
+      suggestedFix: 'Clean up your SVG: remove invisible objects, fix broken paths, simplify geometry in your editor',
     });
   }
 
@@ -231,38 +130,43 @@ export function preflightCheck(
     issues.push({
       severity: 'warning',
       message: `Found ${openPaths} open path${openPaths > 1 ? 's' : ''}`,
-      detail: 'Open paths will be automatically closed during processing, which may produce unexpected results',
+      detail: 'Open paths will be automatically closed, which may produce unexpected results',
       suggestedFix: 'In your SVG editor: close all paths, convert strokes to fills, convert text to paths',
     });
   }
 
   // Require at least some closed paths for most operations
-  if (closedPaths === 0) {
+  if (closedPaths === 0 && openPaths > 0) {
     issues.push({
       severity: 'error',
-      message: 'No closed paths found',
-      detail: 'Extrusion requires closed shapes',
-      suggestedFix: 'Convert strokes to fills, close all open paths, or use shapes instead of lines',
+      message: 'No closed paths found - only strokes or open paths',
+      detail: 'Extrusion requires closed filled shapes, not just outlines',
+      suggestedFix: 'Convert strokes to fills, close all open paths, or use filled shapes instead of strokes',
     });
   }
 
   // Check for excessive node count
-  const avgPointsPerPath = totalPoints / paths.length;
-  if (avgPointsPerPath > 500) {
-    issues.push({
-      severity: 'warning',
-      message: `High node count detected (avg ${Math.round(avgPointsPerPath)} points per path)`,
-      detail: 'Complex paths may slow down processing or cause browser memory issues',
-      suggestedFix: `Increase simplify tolerance to ${(settings.simplifyTolerance * 2).toFixed(2)}mm or higher`,
-    });
+  if (paths.length > 0) {
+    const avgPointsPerPath = totalPoints / paths.length;
+    if (avgPointsPerPath > 500) {
+      issues.push({
+        severity: 'warning',
+        message: `High node count detected (avg ${Math.round(avgPointsPerPath)} points per path)`,
+        detail: 'Complex paths may slow down processing or cause browser memory issues',
+        suggestedFix: `Increase simplify tolerance to ${(settings.simplifyTolerance * 2).toFixed(2)}mm or higher`,
+      });
+    }
   }
 
-  // Check for self-intersections (limited check to avoid performance issues)
+  // Check for self-intersections using SAFE helper (limited check to avoid performance issues)
   const pathsToCheck = paths.slice(0, Math.min(3, paths.length));
   for (const path of pathsToCheck) {
-    if (safeGetIntersections(path)) {
-      hasIntersections = true;
-      break;
+    if (isValidPath(path)) {
+      const intersections = safeGetIntersections(path);
+      if (intersections.length > 0) {
+        hasIntersections = true;
+        break;
+      }
     }
   }
 
@@ -339,62 +243,69 @@ export function processPaths(
 ): paper.CompoundPath {
   const { paths } = parsed;
 
-  // Filter and validate paths before processing
+  // Filter to only valid paths
   const validPaths = paths.filter(isValidPath);
 
   if (validPaths.length === 0) {
-    throw new Error('No valid paths to process after validation');
+    throw new Error(
+      'No valid paths to process. ' +
+      'The SVG geometry became invalid. ' +
+      'Please clean up the SVG file in an editor.'
+    );
   }
 
-  // Clone and process each path
+  // Process each path using ONLY safe operations
   const processedPaths: paper.Path[] = [];
 
-  for (const p of validPaths) {
-    let path = p.clone() as paper.Path;
+  for (const path of validPaths) {
+    // Close open paths using safe helper
+    let processed = safeClosePath(path);
 
-    // Close open paths
-    if (!path.closed) {
-      try {
-        path.closePath();
-      } catch (error) {
-        console.warn('Failed to close path, skipping:', error);
+    // Validate after closing
+    if (!isValidPath(processed)) {
+      console.warn('Path became invalid after closing, skipping');
+      continue;
+    }
+
+    // Simplify if tolerance > 0 using safe helper
+    if (settings.simplifyTolerance > 0) {
+      processed = safeSimplify(processed, settings.simplifyTolerance);
+
+      // Validate after simplify
+      if (!isValidPath(processed)) {
+        console.warn('Path became invalid after simplification, skipping');
         continue;
       }
     }
 
-    // Simplify if tolerance > 0
-    if (settings.simplifyTolerance > 0) {
-      path = safeSimplify(path, settings.simplifyTolerance);
-    }
-
-    // Only keep if still valid after processing
-    if (isValidPath(path)) {
-      processedPaths.push(path);
-    }
+    processedPaths.push(processed);
   }
 
   if (processedPaths.length === 0) {
-    throw new Error('All paths became invalid during processing');
+    throw new Error(
+      'All paths became invalid during processing. ' +
+      'The SVG geometry may be too complex or degenerate. ' +
+      'Please simplify the SVG in an editor.'
+    );
   }
 
-  // Apply offset if needed (skip if zero or near-zero)
+  // Apply offset if needed using safe helper
   let finalPaths = processedPaths;
   if (Math.abs(settings.offset) > 0.001) {
     const offsetPaths: paper.Path[] = [];
 
     for (const path of processedPaths) {
       const offsetPath = safeOffset(path, settings.offset);
+
       if (offsetPath && isValidPath(offsetPath)) {
         offsetPaths.push(offsetPath);
+      } else {
+        // Fallback to non-offset path if offset fails
+        offsetPaths.push(path);
       }
     }
 
-    // Only use offset results if we got valid paths back
-    if (offsetPaths.length > 0) {
-      finalPaths = offsetPaths;
-    } else {
-      console.warn('Offset operation failed for all paths, using non-offset paths');
-    }
+    finalPaths = offsetPaths;
   }
 
   // Remove tiny islands
@@ -405,20 +316,23 @@ export function processPaths(
   }
 
   if (finalPaths.length === 0) {
-    throw new Error('No paths remaining after filtering (all removed as tiny islands or invalid)');
+    throw new Error(
+      'No paths remaining after filtering. ' +
+      'All features were removed as tiny islands or became invalid. ' +
+      'Try reducing the "Remove Islands" threshold or simplifying your SVG.'
+    );
   }
 
-  // Union all paths into a single compound path
-  const compound = new paper.CompoundPath({
-    children: finalPaths.map(p => p.clone()),
-  });
+  // Create compound path and unite using SAFE helper
+  const compound = safeCreateAndUniteCompound(finalPaths);
 
-  // Safely unite to resolve overlaps
-  const united = safeUnite(compound);
-
-  if (!united) {
-    throw new Error('Failed to unite paths - geometry may be too complex or degenerate');
+  if (!compound) {
+    throw new Error(
+      'Failed to create 3D geometry from paths. ' +
+      'The SVG geometry may be too complex or contain invalid shapes. ' +
+      'Please simplify the SVG in an editor (remove overlaps, fix self-intersections).'
+    );
   }
 
-  return united;
+  return compound;
 }

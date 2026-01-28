@@ -2,16 +2,22 @@ import * as THREE from 'three';
 import paper from 'paper';
 import type { ProfileSettings, GenerationResult } from '../types';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
+import { isValidPath, isValidCompoundPath } from './paperSafety';
 
 export function generateMesh(
   compoundPath: paper.CompoundPath,
   settings: ProfileSettings
 ): THREE.Mesh {
+  // Validate input before processing
+  if (!isValidCompoundPath(compoundPath)) {
+    throw new Error('Invalid compound path passed to mesh generator');
+  }
+
   // Convert Paper.js path to THREE.js Shape
   const shapes = pathToShapes(compoundPath);
 
   if (shapes.length === 0) {
-    throw new Error('No valid shapes generated from SVG');
+    throw new Error('No valid shapes generated from SVG geometry');
   }
 
   // Create extruded geometry
@@ -25,18 +31,30 @@ export function generateMesh(
 
   let geometry: THREE.BufferGeometry;
 
-  if (shapes.length === 1) {
-    geometry = new THREE.ExtrudeGeometry(shapes[0], extrudeSettings);
-  } else {
-    // Merge multiple shapes
-    const geometries = shapes.map(shape => new THREE.ExtrudeGeometry(shape, extrudeSettings));
-    geometry = mergeGeometries(geometries);
+  try {
+    if (shapes.length === 1) {
+      geometry = new THREE.ExtrudeGeometry(shapes[0], extrudeSettings);
+    } else {
+      // Merge multiple shapes
+      const geometries = shapes.map(shape => new THREE.ExtrudeGeometry(shape, extrudeSettings));
+      geometry = mergeGeometries(geometries);
+    }
+  } catch (error) {
+    throw new Error(
+      'Failed to extrude geometry. ' +
+      'The shape may be too complex or contain invalid curves. ' +
+      'Try simplifying the SVG.'
+    );
   }
 
   // Add base if needed
   if (settings.baseThickness > 0) {
-    const baseGeometry = createBase(compoundPath, settings.baseThickness);
-    geometry = mergeGeometries([geometry, baseGeometry]);
+    try {
+      const baseGeometry = createBase(compoundPath, settings.baseThickness);
+      geometry = mergeGeometries([geometry, baseGeometry]);
+    } catch (error) {
+      console.warn('Failed to create base, using main geometry only');
+    }
   }
 
   // Center the geometry
@@ -65,46 +83,82 @@ function pathToShapes(compoundPath: paper.CompoundPath): THREE.Shape[] {
     if (!(child instanceof paper.Path)) return;
 
     const path = child as paper.Path;
+
+    // CRITICAL: Validate path before accessing segments
+    if (!isValidPath(path)) {
+      console.warn('Skipping invalid path in mesh generation');
+      return;
+    }
+
     if (!path.segments || path.segments.length < 3) return;
 
-    const shape = new THREE.Shape();
-    let first = true;
+    try {
+      const shape = new THREE.Shape();
+      let first = true;
 
-    path.segments.forEach((segment) => {
-      const point = segment.point;
-      if (first) {
-        shape.moveTo(point.x, -point.y); // Flip Y for THREE.js coordinate system
-        first = false;
-      } else {
-        // Handle curves if present
-        if (segment.handleIn.length > 0) {
-          const prevSeg = path.segments[path.segments.indexOf(segment) - 1];
-          if (prevSeg) {
-            shape.bezierCurveTo(
-              prevSeg.point.x + prevSeg.handleOut.x,
-              -(prevSeg.point.y + prevSeg.handleOut.y),
-              point.x + segment.handleIn.x,
-              -(point.y + segment.handleIn.y),
-              point.x,
-              -point.y
-            );
+      path.segments.forEach((segment) => {
+        // CRITICAL: Check for null segment (causes getDirectedAngle crash)
+        if (!segment || !segment.point) {
+          console.warn('Null segment detected, skipping');
+          return;
+        }
+
+        const point = segment.point;
+
+        // Validate coordinates
+        if (isNaN(point.x) || isNaN(point.y)) {
+          console.warn('NaN coordinates detected, skipping segment');
+          return;
+        }
+
+        if (first) {
+          shape.moveTo(point.x, -point.y); // Flip Y for THREE.js coordinate system
+          first = false;
+        } else {
+          // Handle curves if present
+          if (segment.handleIn && segment.handleIn.length > 0) {
+            const segmentIndex = path.segments.indexOf(segment);
+            const prevSeg = segmentIndex > 0 ? path.segments[segmentIndex - 1] : null;
+
+            if (prevSeg && prevSeg.point && prevSeg.handleOut) {
+              // Validate handle coordinates
+              if (
+                !isNaN(prevSeg.point.x) && !isNaN(prevSeg.point.y) &&
+                !isNaN(prevSeg.handleOut.x) && !isNaN(prevSeg.handleOut.y) &&
+                !isNaN(segment.handleIn.x) && !isNaN(segment.handleIn.y)
+              ) {
+                shape.bezierCurveTo(
+                  prevSeg.point.x + prevSeg.handleOut.x,
+                  -(prevSeg.point.y + prevSeg.handleOut.y),
+                  point.x + segment.handleIn.x,
+                  -(point.y + segment.handleIn.y),
+                  point.x,
+                  -point.y
+                );
+              } else {
+                shape.lineTo(point.x, -point.y);
+              }
+            } else {
+              shape.lineTo(point.x, -point.y);
+            }
           } else {
             shape.lineTo(point.x, -point.y);
           }
-        } else {
-          shape.lineTo(point.x, -point.y);
         }
+      });
+
+      // Check if this is a hole (clockwise vs counter-clockwise)
+      const isHole = path.clockwise;
+
+      if (isHole && shapes.length > 0) {
+        // Add as hole to the last shape
+        shapes[shapes.length - 1].holes.push(shape);
+      } else {
+        shapes.push(shape);
       }
-    });
-
-    // Check if this is a hole (clockwise vs counter-clockwise)
-    const isHole = path.clockwise;
-
-    if (isHole && shapes.length > 0) {
-      // Add as hole to the last shape
-      shapes[shapes.length - 1].holes.push(shape);
-    } else {
-      shapes.push(shape);
+    } catch (error) {
+      console.warn('Failed to convert path to shape:', error);
+      // Continue with other paths
     }
   });
 
@@ -115,7 +169,16 @@ function createBase(
   compoundPath: paper.CompoundPath,
   thickness: number
 ): THREE.BufferGeometry {
+  // Validate input
+  if (!isValidCompoundPath(compoundPath)) {
+    throw new Error('Invalid compound path for base creation');
+  }
+
   const shapes = pathToShapes(compoundPath);
+
+  if (shapes.length === 0) {
+    throw new Error('No shapes for base creation');
+  }
 
   const baseSettings: THREE.ExtrudeGeometryOptions = {
     depth: thickness,
@@ -204,6 +267,11 @@ export async function generate3DModel(
   const startTime = performance.now();
 
   try {
+    // Validate input before mesh generation
+    if (!isValidCompoundPath(compoundPath)) {
+      throw new Error('Invalid geometry passed to 3D generator');
+    }
+
     // Generate mesh
     const mesh = generateMesh(compoundPath, settings);
 

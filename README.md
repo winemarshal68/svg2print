@@ -79,11 +79,15 @@ Moderate thickness with optional bevel. Includes hole for keyring.
 
 The app validates your SVG before generating the model:
 
+- **Invalid geometry**: Detects and filters paths with null segments, NaN coordinates, or zero length
 - **Open paths**: Automatically closed during processing
+- **No closed paths**: Blocks generation if only open paths/strokes exist
 - **High node count**: Recommend increasing simplification
 - **Self-intersections**: Union operations attempt to fix
 - **Tiny features**: Features below threshold are removed
 - **Size warnings**: Alert if model is too large or small for printing
+
+All Paper.js operations (offset, simplify, unite, getIntersections) are wrapped with validation guards to prevent crashes from degenerate geometry.
 
 ## Supported SVG Features
 
@@ -120,6 +124,7 @@ Check `public/samples/` for example SVGs:
 - `star.svg` - Simple polygon shape
 - `heart.svg` - Curved paths
 - `circle-donut.svg` - Shape with hole
+- `degenerate-paths.svg` - Test case for geometry validation (contains invalid paths that are filtered out)
 
 ## Technology Stack
 
